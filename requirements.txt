@@ -8,3 +8,4 @@ torch>=2.2.0
 safetensors>=0.4.3
 html2text==2024.2.26
 tldextract==5.1.2
+beautifulsoup4==4.12.3
