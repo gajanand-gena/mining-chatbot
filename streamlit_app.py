@@ -1,23 +1,22 @@
 # streamlit_app.py
-import os, re, urllib.parse
+import os, re, urllib.parse, math
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
+import requests
+from bs4 import BeautifulSoup
 import streamlit as st
-from duckduckgo_search import DDGS
 import trafilatura
 import html2text
 import tldextract
-import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline
-import requests
-from bs4 import BeautifulSoup
+from pdfminer.high_level import extract_text as pdf_extract_text
 
-# ------------------------------
-# Config
-# ------------------------------
+# =========================
+# Config / constants
+# =========================
 DEFAULT_DOMAINS = [
     "dgms.gov.in","ibm.gov.in","mines.gov.in","coal.nic.in","moefcc.gov.in",
     "coalindia.in","secl-cil.in","nclcil.in","scclmines.com","nmdc.co.in","hzlindia.com",
@@ -31,8 +30,8 @@ MINING_KEYWORDS = [
 ]
 
 EMBED_MODEL = os.getenv("EMBED_MODEL", "thenlper/gte-small")
-LOCAL_HF_MODEL = os.getenv("LOCAL_HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")  # CPU-friendly
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # optional (only if you add OPENAI_API_KEY)
+LOCAL_HF_MODEL = os.getenv("LOCAL_HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")  # small, CPU ok
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # optional, only if OPENAI_API_KEY set
 
 SYSTEM_PROMPT = """You are MINER-GPT, a safety-first assistant for mining operations in India.
 Rules:
@@ -51,59 +50,113 @@ SAFETY_BLOCKLIST = [
     r"illegal .*mining", r"forge .*certificate", r"improvised.*explosive"
 ]
 
-# ------------------------------
-# Simple calculators
-# ------------------------------
-def tonnes_per_hour(bucket_m3, fill_factor, density_t_per_m3, cycle_time_min, passes):
-    bucket_t = bucket_m3 * fill_factor * density_t_per_m3
-    return (passes * bucket_t) * (60.0 / cycle_time_min)
+# =========================
+# Secrets / env
+# =========================
+def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+    # Prefer Streamlit secrets, then env
+    return st.secrets.get(name) if name in st.secrets else os.getenv(name, default)
 
-def availability(mtbf_h, mttr_h):
-    return mtbf_h / max(mtbf_h + mttr_h, 1e-9)
+GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
+GOOGLE_CSE_ID = get_secret("GOOGLE_CSE_ID")   # aka "cx"
+SERPAPI_API_KEY = get_secret("SERPAPI_API_KEY")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 
-def cost_per_tonne(fuel_lph, diesel_rs_per_l, prod_tph, other_rs_per_hr=0.0):
-    return (fuel_lph * diesel_rs_per_l + other_rs_per_hr) / max(prod_tph, 1e-6)
-
-# ------------------------------
-# Retrieval (search + scrape + chunk + embed)
-# ------------------------------
-def ddg_search(q, max_results=8, site_filters=None):
-    """
-    Try official duckduckgo_search first. If it fails (vqd error / 403 / None),
-    fallback to scraping the lite HTML endpoint.
-    """
-    q2 = q
-    if site_filters:
-        domain_q = " OR ".join([f"site:{d}" for d in site_filters])
-        q2 = f"({q}) ({domain_q})"
-    kw = " ".join(MINING_KEYWORDS[:6])
-    q2 = f"{q2} india mining {kw}"
-
-    # 1) primary: API
+# =========================
+# Utilities
+# =========================
+def clean_domain(url: str) -> str:
     try:
-        with DDGS(timeout=30) as ddgs:
-            results = list(ddgs.text(q2, max_results=max_results, safesearch="moderate", region="in-en"))
-            if results:
-                return results
+        ext = tldextract.extract(url)
+        return ".".join([p for p in [ext.domain, ext.suffix] if p])
     except Exception:
-        pass  # fall through
+        return url
 
-    # 2) fallback: lite HTML scraping
-    return ddg_html_fallback(q2, max_results=max_results)
+def add_domain_operators(query: str, prefer_domains: bool, limit: int = 6) -> str:
+    if not prefer_domains:
+        return query
+    # Keep query length reasonable for Google; include a few high-signal domains
+    ops = " OR ".join([f"site:{d}" for d in DEFAULT_DOMAINS[:limit]])
+    kw = " ".join(MINING_KEYWORDS[:6])
+    return f"({query}) ({ops}) india mining {kw}"
 
-def ddg_html_fallback(q, max_results=8):
+# =========================
+# Web search (Google-first)
+# =========================
+def google_search_json(query: str, max_results: int = 8) -> List[Dict]:
     """
-    Scrape DuckDuckGo's lite HTML results. Returns list of dicts with keys: title, href.
-    Handles /l/?uddg=<encoded> redirect links.
+    Google Programmable Search JSON API (needs GOOGLE_API_KEY & GOOGLE_CSE_ID).
+    Returns: list of {title, href}
+    """
+    if not (GOOGLE_API_KEY and GOOGLE_CSE_ID):
+        return []
+    items: List[Dict] = []
+    # Google returns up to 10 items per request; paginate if needed
+    for start in range(1, min(max_results, 50) + 1, 10):
+        params = {
+            "key": GOOGLE_API_KEY,
+            "cx": GOOGLE_CSE_ID,
+            "q": query,
+            "num": min(10, max_results - len(items)),
+            "start": start,
+            "safe": "active",
+            "lr": "lang_en"  # prefer English
+        }
+        try:
+            r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            for it in data.get("items", []):
+                link = it.get("link")
+                title = it.get("title") or link
+                if link and link.startswith("http"):
+                    items.append({"title": title, "href": link})
+                if len(items) >= max_results:
+                    break
+            if len(items) >= max_results or not data.get("items"):
+                break
+        except Exception:
+            break
+    return items
+
+def serpapi_search(query: str, max_results: int = 8) -> List[Dict]:
+    """
+    SerpAPI fallback (needs SERPAPI_API_KEY).
+    """
+    if not SERPAPI_API_KEY:
+        return []
+    try:
+        params = {
+            "engine": "google",
+            "q": query,
+            "num": max_results,
+            "hl": "en",
+            "api_key": SERPAPI_API_KEY,
+        }
+        r = requests.get("https://serpapi.com/search.json", params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        out = []
+        for res in (data.get("organic_results") or []):
+            link = res.get("link")
+            title = res.get("title") or link
+            if link and link.startswith("http"):
+                out.append({"title": title, "href": link})
+            if len(out) >= max_results:
+                break
+        return out
+    except Exception:
+        return []
+
+def ddg_html_fallback(query: str, max_results: int = 8) -> List[Dict]:
+    """
+    DuckDuckGo Lite HTML (no keys). Returns list of {title, href}.
+    Handles /l/?uddg redirection links.
     """
     url = "https://duckduckgo.com/html/"
-    params = {"q": q}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=20)
+        r = requests.get(url, params={"q": query}, headers=headers, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         out = []
@@ -112,43 +165,70 @@ def ddg_html_fallback(q, max_results=8):
             title = a.get_text(" ", strip=True)
             if not href:
                 continue
-            # Handle /l/?uddg= redirect format
             if href.startswith("/l/?"):
                 parsed = urllib.parse.urlparse(href)
                 qs = urllib.parse.parse_qs(parsed.query)
                 if "uddg" in qs and qs["uddg"]:
                     href = urllib.parse.unquote(qs["uddg"][0])
             if href.startswith("http"):
-                out.append({"title": title, "href": href})
+                out.append({"title": title or href, "href": href})
             if len(out) >= max_results:
                 break
         return out
     except Exception:
         return []
 
-def clean_domain(url):
-    try:
-        ext = tldextract.extract(url)
-        return ".".join([p for p in [ext.domain, ext.suffix] if p])
-    except Exception:
-        return url
+def web_search(query: str, max_results: int, prefer_domains: bool) -> List[Dict]:
+    q = add_domain_operators(query, prefer_domains)
+    # 1) Google CSE
+    items = google_search_json(q, max_results=max_results)
+    if items:
+        return items
+    # 2) SerpAPI
+    items = serpapi_search(q, max_results=max_results)
+    if items:
+        return items
+    # 3) DDG Lite
+    return ddg_html_fallback(q, max_results=max_results)
 
-def fetch_text(url, timeout=20):
+# =========================
+# Fetch & parse content
+# =========================
+def fetch_text(url: str, timeout: int = 20) -> str:
+    """
+    Fetch text from HTML or PDF. Returns '' on failure.
+    """
     try:
+        # HEAD to check content-type (don't fail if blocked)
+        ctype = None
+        try:
+            h = requests.head(url, timeout=10, allow_redirects=True)
+            ctype = (h.headers.get("Content-Type") or "").lower()
+        except Exception:
+            pass
+
+        # PDF path
+        if (ctype and "pdf" in ctype) or url.lower().endswith(".pdf"):
+            r = requests.get(url, timeout=timeout, stream=True)
+            r.raise_for_status()
+            return (pdf_extract_text(r.raw) or "").strip()[:200_000]
+
+        # HTML path
         downloaded = trafilatura.fetch_url(url, timeout=timeout)
         if not downloaded:
             return ""
         text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
         if text and len(text.strip()) > 200:
             return text.strip()
-        # fallback: convert the same downloaded HTML to text
+
+        # fallback: simple HTML → text
         parser = html2text.HTML2Text()
         parser.ignore_links = True
-        return parser.handle(downloaded)[:20000]
+        return parser.handle(downloaded)[:20_000]
     except Exception:
         return ""
 
-def chunk(text, chunk_size=900, overlap=150):
+def chunk(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
     parts = re.split(r"(?<=[\.\?\!])\s+|\n{2,}", text)
     chunks, cur = [], ""
     for p in parts:
@@ -166,6 +246,9 @@ def chunk(text, chunk_size=900, overlap=150):
             final.append((tail + " " + ch).strip())
     return [c for c in final if c.strip()]
 
+# =========================
+# Retrieval
+# =========================
 @dataclass
 class DocChunk:
     text: str
@@ -177,50 +260,45 @@ def get_embedder():
     return SentenceTransformer(EMBED_MODEL)
 
 class Retriever:
-    def __init__(self, embed_model=EMBED_MODEL):
+    def __init__(self):
         self.model = get_embedder()
         self.index = None
         self.meta: List[DocChunk] = []
 
     def build(self, docs: List[DocChunk]):
         if not docs:
-            self.index = None
-            self.meta = []
-            return
+            self.index = None; self.meta = []; return
         self.meta = docs
         X = self.model.encode([d.text for d in docs], normalize_embeddings=True, batch_size=32)
         dim = X.shape[1]
         self.index = faiss.IndexFlatIP(dim)
         self.index.add(X.astype("float32"))
 
-    def search(self, query, top_k=6):
+    def search(self, query: str, k: int = 6) -> List[Tuple[float, DocChunk]]:
         if not self.index or not self.meta:
             return []
         qv = self.model.encode([query], normalize_embeddings=True)
-        D, I = self.index.search(qv.astype("float32"), top_k)
-        hits = []
+        D, I = self.index.search(qv.astype("float32"), k)
+        hits: List[Tuple[float, DocChunk]] = []
         for score, idx in zip(D[0], I[0]):
-            if idx < 0:
-                continue
-            d = self.meta[idx]
-            hits.append((float(score), d))
+            if 0 <= idx < len(self.meta):
+                hits.append((float(score), self.meta[idx]))
         return hits
 
-# ------------------------------
-# Generation backends
-# ------------------------------
-def has_openai():
-    return bool(os.getenv("OPENAI_API_KEY"))
+# =========================
+# Generation
+# =========================
+def has_openai() -> bool:
+    return bool(OPENAI_API_KEY)
 
-def gen_with_openai(system_prompt, user_prompt):
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}", "Content-Type": "application/json"}
+def gen_with_openai(system_prompt: str, user_prompt: str) -> str:
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": OPENAI_MODEL,
         "messages": [{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}],
         "temperature": 0.2
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=60)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip()
 
@@ -238,15 +316,15 @@ def get_local_pipe():
         trust_remote_code=True,
     )
 
-def gen_with_local(system_prompt, user_prompt):
+def gen_with_local(system_prompt: str, user_prompt: str) -> str:
     pipe = get_local_pipe()
     prompt = f"<|system|>\n{system_prompt}\n<|user|>\n{user_prompt}\n<|assistant|>\n"
     out = pipe(prompt)[0]["generated_text"]
     return out.split("<|assistant|>")[-1].strip()
 
-# ------------------------------
+# =========================
 # Safety
-# ------------------------------
+# =========================
 def is_unsafe(q: str) -> Tuple[bool, str]:
     low = q.lower()
     if any(re.search(pat, low) for pat in SAFETY_BLOCKLIST):
@@ -257,17 +335,17 @@ def is_unsafe(q: str) -> Tuple[bool, str]:
         return True, "Explosives/blasting instructions require licensed personnel per DGMS. I can only provide high-level regulatory info."
     return False, ""
 
-# ------------------------------
-# UI
-# ------------------------------
-st.set_page_config(page_title="MINER-GPT (India) – Web RAG", page_icon="⛏️", layout="wide")
-st.title("⛏️ MINER-GPT (India) – Web-powered Mining Chatbot")
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="MINER-GPT (India) – Web RAG (Google-first)", page_icon="⛏️", layout="wide")
+st.title("⛏️ MINER-GPT (India) – Web-powered Mining Chatbot (Google-first)")
 
 with st.sidebar:
     st.header("Settings")
     use_openai = st.toggle("Use OpenAI (set OPENAI_API_KEY)", value=has_openai())
-    top_sites_only = st.toggle("Prefer India mining domains", value=True)
-    max_sites = st.slider("Max sites to ingest per query", 2, 12, 6)
+    prefer_domains = st.toggle("Prefer India mining domains", value=True)
+    max_sites = st.slider("Max sites to ingest per query", 3, 12, 8)
     top_k_ctx = st.slider("Retrieved chunks (Top-K)", 3, 12, 6)
     st.markdown("---")
     st.subheader("Mining calculators")
@@ -277,38 +355,47 @@ with st.sidebar:
         d = st.number_input("Density (t/m³)", 1.4, 3.5, 2.1, 0.1)
         c = st.number_input("Cycle time (min)", 0.3, 5.0, 0.9, 0.05)
         p = st.number_input("Passes", 1, 12, 4, 1)
-        st.info(f"Estimated **{tonnes_per_hour(b,f,d,c,p):.1f} tph**")
+        st.info(f"Estimated **{ (b*f*d)*p* (60.0/c):.1f} tph**")
     with st.expander("Equipment availability"):
         mtbf = st.number_input("MTBF (h)", 1.0, 500.0, 28.0, 0.5)
         mttr = st.number_input("MTTR (h)", 0.1, 48.0, 2.0, 0.1)
-        st.info(f"Availability ≈ **{availability(mtbf, mttr):.3f}**")
+        avail = mtbf / max(mtbf + mttr, 1e-9)
+        st.info(f"Availability ≈ **{avail:.3f}**")
     with st.expander("Cost per tonne (₹/t)"):
         lph = st.number_input("Fuel (L/h)", 5.0, 400.0, 80.0, 1.0)
         price = st.number_input("Diesel (₹/L)", 50.0, 140.0, 95.0, 1.0)
         tph = st.number_input("Production (t/h)", 10.0, 10000.0, 800.0, 10.0)
         other = st.number_input("Other ₹/h", 0.0, 100000.0, 1500.0, 100.0)
-        st.info(f"Cost ≈ **₹{cost_per_tonne(lph, price, tph, other):.2f}/t**")
+        cost = (lph*price + other) / max(tph, 1e-6)
+        st.info(f"Cost ≈ **₹{cost:.2f}/t**")
     st.markdown("---")
-    st.caption("Tip: ask things like “haul road gradient per DGMS?” or “bench width for 100T trucks in Indian practice?”")
+    st.caption("Tip: e.g., “DGMS haul road gradient for 100T trucks”, “bench height limits for opencast”, “IBM monthly return norms”")
 
 st.write("Ask anything about **mining operations (India)**. I’ll search authoritative sources, read them, and answer with citations.")
 q = st.text_input("Your question", placeholder="e.g., Recommended haul road gradient per DGMS?")
 
 def build_context_from_web(query: str, max_sites: int, prefer_domains: bool) -> Tuple[List[DocChunk], List[Dict]]:
-    filters = DEFAULT_DOMAINS if prefer_domains else None
-    results = ddg_search(query, max_results=max_sites, site_filters=filters)
-    docs, used = [], []
-    for r in results:
-        url = r.get("href") or r.get("url") or r.get("link")
-        if not url:
-            continue
-        domain = clean_domain(url)
-        txt = fetch_text(url)
-        if len(txt) < 400:  # skip weak pages
-            continue
-        for ch in chunk(txt, 900, 150)[:8]:
-            docs.append(DocChunk(text=ch, source=domain, url=url))
-        used.append({"title": r.get("title") or domain, "url": url, "domain": domain})
+    def _run_once(q, cap):
+        results = web_search(q, max_results=cap, prefer_domains=prefer_domains)
+        docs, used = [], []
+        for r in results:
+            url = r.get("href") or r.get("link") or r.get("url")
+            if not url:
+                continue
+            domain = clean_domain(url)
+            txt = fetch_text(url)
+            if len(txt) < 200:
+                continue
+            for ch in chunk(txt, 900, 150)[:8]:
+                docs.append(DocChunk(text=ch, source=domain, url=url))
+            used.append({"title": r.get("title") or domain, "url": url, "domain": domain})
+        return docs, used
+
+    base_q = q if q else query
+    docs, used = _run_once(base_q, max_sites)
+    if not docs and prefer_domains:
+        # retry without domain bias
+        docs, used = _run_once(query, max_sites)
     return docs, used
 
 def format_sources(srcs: List[Dict]) -> str:
@@ -319,11 +406,11 @@ def format_sources(srcs: List[Dict]) -> str:
         lines.append(f"- {title} ({s['domain']})")
     return "\n".join(lines)
 
-def build_user_prompt(query: str, hits):
-    ctx = []
+def build_user_prompt(query: str, hits: List[Tuple[float, DocChunk]]) -> str:
+    ctx_lines = []
     for i, (score, d) in enumerate(hits, 1):
-        ctx.append(f"[{i}] {d.text}\n(Source: {d.source} | {d.url})")
-    ctx_text = "\n\n---\n\n".join(ctx)
+        ctx_lines.append(f"[{i}] {d.text}\n(Source: {d.source} | {d.url})")
+    ctx_text = "\n\n---\n\n".join(ctx_lines)
     helper = (
         "Useful calculators:\n"
         "- tonnes_per_hour(bucket_m3, fill_factor, density_t_per_m3, cycle_time_min, passes)\n"
@@ -344,14 +431,14 @@ if st.button("Answer", type="primary") and q:
         st.stop()
 
     with st.spinner("Searching authoritative sources…"):
-        docs, sources_used = build_context_from_web(q, max_sites=max_sites, prefer_domains=top_sites_only)
+        docs, sources_used = build_context_from_web(q, max_sites=max_sites, prefer_domains=prefer_domains)
     if not docs:
-        st.warning("Couldn’t find strong sources. Try more specific wording or disable the domain filter.")
+        st.warning("Couldn’t find strong sources. Try toggling domain preference off, or ask more specifically.")
         st.stop()
 
-    retriever = Retriever(EMBED_MODEL)
+    retriever = Retriever()
     retriever.build(docs)
-    hits = retriever.search(q, top_k=top_k_ctx)
+    hits = retriever.search(q, k=top_k_ctx)
 
     user_prompt = build_user_prompt(q, hits)
 
