@@ -1,5 +1,5 @@
 # streamlit_app.py
-import os, re
+import os, re, urllib.parse
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
 
@@ -90,11 +90,47 @@ def ddg_search(q, max_results=8, site_filters=None):
 
     # 2) fallback: lite HTML scraping
     return ddg_html_fallback(q2, max_results=max_results)
-    def clean_domain(url):
+
+def ddg_html_fallback(q, max_results=8):
+    """
+    Scrape DuckDuckGo's lite HTML results. Returns list of dicts with keys: title, href.
+    Handles /l/?uddg=<encoded> redirect links.
+    """
+    url = "https://duckduckgo.com/html/"
+    params = {"q": q}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    }
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        out = []
+        for a in soup.select("a.result__a, a.result__url"):
+            href = a.get("href")
+            title = a.get_text(" ", strip=True)
+            if not href:
+                continue
+            # Handle /l/?uddg= redirect format
+            if href.startswith("/l/?"):
+                parsed = urllib.parse.urlparse(href)
+                qs = urllib.parse.parse_qs(parsed.query)
+                if "uddg" in qs and qs["uddg"]:
+                    href = urllib.parse.unquote(qs["uddg"][0])
+            if href.startswith("http"):
+                out.append({"title": title, "href": href})
+            if len(out) >= max_results:
+                break
+        return out
+    except Exception:
+        return []
+
+def clean_domain(url):
     try:
         ext = tldextract.extract(url)
         return ".".join([p for p in [ext.domain, ext.suffix] if p])
-    except:
+    except Exception:
         return url
 
 def fetch_text(url, timeout=20):
@@ -105,12 +141,10 @@ def fetch_text(url, timeout=20):
         text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
         if text and len(text.strip()) > 200:
             return text.strip()
-        h = trafilatura.fetch_url(url, timeout=timeout)
-        if not h:
-            return ""
+        # fallback: convert the same downloaded HTML to text
         parser = html2text.HTML2Text()
         parser.ignore_links = True
-        return parser.handle(h)[:20000]
+        return parser.handle(downloaded)[:20000]
     except Exception:
         return ""
 
@@ -138,15 +172,21 @@ class DocChunk:
     source: str
     url: str
 
+@st.cache_resource(show_spinner=False)
+def get_embedder():
+    return SentenceTransformer(EMBED_MODEL)
+
 class Retriever:
     def __init__(self, embed_model=EMBED_MODEL):
-        self.model = SentenceTransformer(embed_model)
+        self.model = get_embedder()
         self.index = None
         self.meta: List[DocChunk] = []
 
     def build(self, docs: List[DocChunk]):
         if not docs:
-            self.index = None; self.meta = []; return
+            self.index = None
+            self.meta = []
+            return
         self.meta = docs
         X = self.model.encode([d.text for d in docs], normalize_embeddings=True, batch_size=32)
         dim = X.shape[1]
@@ -154,44 +194,17 @@ class Retriever:
         self.index.add(X.astype("float32"))
 
     def search(self, query, top_k=6):
-        if not self.index or not self.meta: return []
+        if not self.index or not self.meta:
+            return []
         qv = self.model.encode([query], normalize_embeddings=True)
         D, I = self.index.search(qv.astype("float32"), top_k)
         hits = []
         for score, idx in zip(D[0], I[0]):
-            if idx < 0: continue
+            if idx < 0:
+                continue
             d = self.meta[idx]
             hits.append((float(score), d))
         return hits
-
-
-def ddg_html_fallback(q, max_results=8):
-    """
-    Scrape DuckDuckGo's lite HTML results. Returns list of dicts with keys: title, href.
-    """
-    url = "https://duckduckgo.com/html/"
-    params = {"q": q}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    }
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=20)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        out = []
-        # each result link is in a <a class="result__a"> or within result links
-        for a in soup.select("a.result__a, a.result__url"):
-            href = a.get("href")
-            title = a.get_text(" ", strip=True)
-            if href and href.startswith("http"):
-                out.append({"title": title, "href": href})
-            if len(out) >= max_results:
-                break
-        return out
-    except Exception:
-        return []
-
 
 # ------------------------------
 # Generation backends
@@ -200,7 +213,6 @@ def has_openai():
     return bool(os.getenv("OPENAI_API_KEY"))
 
 def gen_with_openai(system_prompt, user_prompt):
-    import requests
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}", "Content-Type": "application/json"}
     payload = {
@@ -288,7 +300,8 @@ def build_context_from_web(query: str, max_sites: int, prefer_domains: bool) -> 
     docs, used = [], []
     for r in results:
         url = r.get("href") or r.get("url") or r.get("link")
-        if not url: continue
+        if not url:
+            continue
         domain = clean_domain(url)
         txt = fetch_text(url)
         if len(txt) < 400:  # skip weak pages
