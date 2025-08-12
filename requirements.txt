@@ -1,1 +1,10 @@
-pip install -r requirements.txt
+streamlit==1.37.1
+duckduckgo-search==6.3.7
+trafilatura==1.12.2
+sentence-transformers==3.0.1
+faiss-cpu==1.8.0
+transformers==4.42.4
+torch>=2.2.0
+safetensors>=0.4.3
+html2text==2024.2.26
+tldextract==5.1.2
