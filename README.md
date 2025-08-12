@@ -1,19 +1,8 @@
-# 🎈 Blank app template
+# MINER-GPT (India) — Streamlit Web-RAG Chatbot
 
-A simple Streamlit app template for you to modify!
+Zero-config chatbot for India-focused mining operations. It searches authoritative Indian sources (DGMS, IBM, PSUs, OEMs), scrapes pages, does lightweight RAG with FAISS + `gte-small`, and answers with citations. Runs **without any API keys** using a local Hugging Face model by default.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
-
-### How to run it on your own machine
-
-1. Install the requirements
-
-   ```
-   $ pip install -r requirements.txt
-   ```
-
-2. Run the app
-
-   ```
-   $ streamlit run streamlit_app.py
-   ```
+## Run locally
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
