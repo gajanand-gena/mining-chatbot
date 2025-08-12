@@ -1,17 +1,15 @@
-# app.py
-import os, re, time, math, html
-import json
-import tldextract
-from typing import List, Dict, Tuple
+# streamlit_app.py
+import os, re
 from dataclasses import dataclass
+from typing import List, Dict, Tuple
 
 import streamlit as st
 from duckduckgo_search import DDGS
 import trafilatura
 import html2text
+import tldextract
 import numpy as np
 import faiss
-
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline
 
@@ -19,33 +17,27 @@ from transformers import pipeline
 # Config
 # ------------------------------
 DEFAULT_DOMAINS = [
-    # India govt / regulators / PSUs / institutes
-    "dgms.gov.in", "ibm.gov.in", "coal.nic.in", "mines.gov.in", "moef.gov.in", "moefcc.gov.in",
-    "coalindia.in", "secl-cil.in", "nclcil.in", "scclmines.com", "nmdc.co.in", "hzlindia.com",
-    "vedantalimited.com", "sail.co.in", "hindustancopper.com", "bsesdelhi.com", "becnm.gov.in",
-    "cmpdi.co.in", "iitg.ac.in", "iitism.ac.in", "iitkgp.ac.in",
-    # OEMs & standards
-    "cat.com", "komatsu.jp", "eimcoelecon.in", "isstandards.in", "bis.gov.in",
+    "dgms.gov.in","ibm.gov.in","mines.gov.in","coal.nic.in","moefcc.gov.in",
+    "coalindia.in","secl-cil.in","nclcil.in","scclmines.com","nmdc.co.in","hzlindia.com",
+    "vedantalimited.com","sail.co.in","hindustancopper.com","cmpdi.co.in",
+    "iitism.ac.in","iitkgp.ac.in","iitg.ac.in","bis.gov.in","isstandards.in","cat.com","komatsu.jp"
 ]
 MINING_KEYWORDS = [
-    "DGMS", "IBM", "MMDR", "MCR", "blasting", "overburden", "stripping ratio", "dragline",
-    "shovel", "dumper", "grade control", "beneficiation", "haul road", "MTBF", "MTTR",
-    "availability", "OEE", "HSE", "ESG", "mine planning", "drilling", "ventilation",
-    "opencast", "underground", "longwall", "bord and pillar", "dispatch"
+    "DGMS","IBM","MMDR","haul road","stripping ratio","dragline","shovel","dumper",
+    "grade control","beneficiation","drilling","blasting","ventilation","opencast","underground",
+    "MTBF","MTTR","availability","OEE","dispatch","mine planning"
 ]
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "thenlper/gte-small")  # small & good
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")      # optional if you have a key
-LOCAL_HF_MODEL = os.getenv("LOCAL_HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "thenlper/gte-small")
+LOCAL_HF_MODEL = os.getenv("LOCAL_HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")  # CPU-friendly
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # optional (only if you add OPENAI_API_KEY)
 
-SYSTEM_PROMPT = """You are MINER-GPT, a safety-first assistant focused on mining operations in India.
-
+SYSTEM_PROMPT = """You are MINER-GPT, a safety-first assistant for mining operations in India.
 Rules:
-- Prefer Indian context: ₹, tonnes (t), bcm, kWh, km/h, DGMS/IBM/MMDR norms, Indian fleets and practices.
-- Cite web sources you used (with domains) and clearly separate facts from assumptions.
-- Be practical and concise for shift use; include bullet steps and formulas where useful.
-- Safety first: Do NOT provide instructions that bypass interlocks, explosives handling beyond public safety guidance, or anything violating DGMS/regulations. If asked, refuse and suggest contacting the mine manager/blasting officer.
-- If sources conflict, state both views and what’s commonly adopted in India.
+- Prefer Indian context: ₹, tonnes (t), bcm, kWh, DGMS/IBM/MMDR norms, Indian fleets.
+- Cite sources you used (domains). If unsure, say what is missing.
+- Be concise and practical for shift use; include bullet steps and formulas where useful.
+- Safety first: Do NOT provide explosives handling or instructions violating DGMS/regulations.
 Format:
 1) Direct answer
 2) Key steps / calculations
@@ -53,12 +45,12 @@ Format:
 """
 
 SAFETY_BLOCKLIST = [
-    r"how .*make.*explosive", r"bypass .*interlock", r"disable .*fail[- ]?safe",
-    r"illegal .*mining", r"forge .*certificate", r"gunpowder", r"improvised.*explosive",
+    r"how .*make.*explosive", r"bypass .*interlock", r"disable .*failsafe",
+    r"illegal .*mining", r"forge .*certificate", r"improvised.*explosive"
 ]
 
 # ------------------------------
-# Simple domain tools & math
+# Simple calculators
 # ------------------------------
 def tonnes_per_hour(bucket_m3, fill_factor, density_t_per_m3, cycle_time_min, passes):
     bucket_t = bucket_m3 * fill_factor * density_t_per_m3
@@ -78,7 +70,6 @@ def ddg_search(q, max_results=8, site_filters=None):
     if site_filters:
         domain_q = " OR ".join([f"site:{d}" for d in site_filters])
         q2 = f"({q}) ({domain_q})"
-    # Small bias to India mining
     kw = " ".join(MINING_KEYWORDS[:6])
     q2 = f"{q2} india mining {kw}"
     with DDGS() as ddgs:
@@ -99,7 +90,6 @@ def fetch_text(url, timeout=20):
         text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
         if text and len(text.strip()) > 200:
             return text.strip()
-        # fallback: html2text
         h = trafilatura.fetch_url(url, timeout=timeout)
         if not h:
             return ""
@@ -119,7 +109,6 @@ def chunk(text, chunk_size=900, overlap=150):
             if cur: chunks.append(cur.strip())
             cur = p
     if cur: chunks.append(cur.strip())
-    # overlap
     final = []
     for i, ch in enumerate(chunks):
         if i == 0: final.append(ch)
@@ -131,7 +120,7 @@ def chunk(text, chunk_size=900, overlap=150):
 @dataclass
 class DocChunk:
     text: str
-    source: str   # domain or short url
+    source: str
     url: str
 
 class Retriever:
@@ -142,9 +131,7 @@ class Retriever:
 
     def build(self, docs: List[DocChunk]):
         if not docs:
-            self.index = None
-            self.meta = []
-            return
+            self.index = None; self.meta = []; return
         self.meta = docs
         X = self.model.encode([d.text for d in docs], normalize_embeddings=True, batch_size=32)
         dim = X.shape[1]
@@ -152,8 +139,7 @@ class Retriever:
         self.index.add(X.astype("float32"))
 
     def search(self, query, top_k=6):
-        if not self.index or not self.meta:
-            return []
+        if not self.index or not self.meta: return []
         qv = self.model.encode([query], normalize_embeddings=True)
         D, I = self.index.search(qv.astype("float32"), top_k)
         hits = []
@@ -167,10 +153,9 @@ class Retriever:
 # Generation backends
 # ------------------------------
 def has_openai():
-    return os.getenv("OPENAI_API_KEY") is not None and len(os.getenv("OPENAI_API_KEY")) > 5
+    return bool(os.getenv("OPENAI_API_KEY"))
 
 def gen_with_openai(system_prompt, user_prompt):
-    # Minimal dependency to avoid extra installs
     import requests
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}", "Content-Type": "application/json"}
@@ -185,7 +170,6 @@ def gen_with_openai(system_prompt, user_prompt):
 
 @st.cache_resource(show_spinner=False)
 def get_local_pipe():
-    # Small local chat model; works on CPU
     return pipeline(
         "text-generation",
         model=LOCAL_HF_MODEL,
@@ -205,30 +189,27 @@ def gen_with_local(system_prompt, user_prompt):
     return out.split("<|assistant|>")[-1].strip()
 
 # ------------------------------
-# Safety & policy checks
+# Safety
 # ------------------------------
 def is_unsafe(q: str) -> Tuple[bool, str]:
     low = q.lower()
     if any(re.search(pat, low) for pat in SAFETY_BLOCKLIST):
-        return True, "This request appears to involve unsafe or illegal instructions."
-    # explosives specific
+        return True, "This looks unsafe/illegal. I can only share public safety/regulatory info."
     if "blast" in low or "explosive" in low:
-        # allow generic safety/regulatory info only
-        if any(x in low for x in ["procedure", "regulation", "regulations", "license", "permit", "dgms", "mmdr"]):
+        if any(x in low for x in ["procedure","regulation","license","permit","dgms","mmdr"]):
             return False, ""
-        return True, "Explosives/blasting instructions must be handled by licensed personnel as per DGMS; I can only share public safety/regulatory info."
+        return True, "Explosives/blasting instructions require licensed personnel per DGMS. I can only provide high-level regulatory info."
     return False, ""
 
 # ------------------------------
-# Streamlit UI
+# UI
 # ------------------------------
 st.set_page_config(page_title="MINER-GPT (India) – Web RAG", page_icon="⛏️", layout="wide")
 st.title("⛏️ MINER-GPT (India) – Web-powered Mining Chatbot")
 
 with st.sidebar:
     st.header("Settings")
-    st.caption("Defaults work out-of-the-box.")
-    use_openai = st.toggle("Use OpenAI (set OPENAI_API_KEY env var)", value=has_openai())
+    use_openai = st.toggle("Use OpenAI (set OPENAI_API_KEY)", value=has_openai())
     top_sites_only = st.toggle("Prefer India mining domains", value=True)
     max_sites = st.slider("Max sites to ingest per query", 2, 12, 6)
     top_k_ctx = st.slider("Retrieved chunks (Top-K)", 3, 12, 6)
@@ -249,20 +230,17 @@ with st.sidebar:
         lph = st.number_input("Fuel (L/h)", 5.0, 400.0, 80.0, 1.0)
         price = st.number_input("Diesel (₹/L)", 50.0, 140.0, 95.0, 1.0)
         tph = st.number_input("Production (t/h)", 10.0, 10000.0, 800.0, 10.0)
-        other = st.number_input("Other ₹/h", 0.0, 1_00_000.0, 1500.0, 100.0)
+        other = st.number_input("Other ₹/h", 0.0, 100000.0, 1500.0, 100.0)
         st.info(f"Cost ≈ **₹{cost_per_tonne(lph, price, tph, other):.2f}/t**")
     st.markdown("---")
-    st.caption("Tip: ask things like “bench width for 100T trucks as per Indian practice?” or “DGMS norms for haul road gradient”.")
+    st.caption("Tip: ask things like “haul road gradient per DGMS?” or “bench width for 100T trucks in Indian practice?”")
 
 st.write("Ask anything about **mining operations (India)**. I’ll search authoritative sources, read them, and answer with citations.")
-
-q = st.text_input("Your question", placeholder="e.g., Recommended haul road gradient per DGMS for 100T mine trucks?")
+q = st.text_input("Your question", placeholder="e.g., Recommended haul road gradient per DGMS?")
 
 def build_context_from_web(query: str, max_sites: int, prefer_domains: bool) -> Tuple[List[DocChunk], List[Dict]]:
-    # 1) Search
     filters = DEFAULT_DOMAINS if prefer_domains else None
     results = ddg_search(query, max_results=max_sites, site_filters=filters)
-    # 2) Fetch & chunk
     docs, used = [], []
     for r in results:
         url = r.get("href") or r.get("url") or r.get("link")
@@ -277,7 +255,6 @@ def build_context_from_web(query: str, max_sites: int, prefer_domains: bool) -> 
     return docs, used
 
 def format_sources(srcs: List[Dict]) -> str:
-    # Make a tidy list
     lines = []
     for s in srcs:
         title = (s["title"] or s["domain"]).strip()
@@ -285,17 +262,17 @@ def format_sources(srcs: List[Dict]) -> str:
         lines.append(f"- {title} ({s['domain']})")
     return "\n".join(lines)
 
-def build_user_prompt(query: str, hits: List[Tuple[float, DocChunk]]) -> str:
+def build_user_prompt(query: str, hits):
     ctx = []
     for i, (score, d) in enumerate(hits, 1):
         ctx.append(f"[{i}] {d.text}\n(Source: {d.source} | {d.url})")
     ctx_text = "\n\n---\n\n".join(ctx)
     helper = (
-        "Useful calculators available:\n"
+        "Useful calculators:\n"
         "- tonnes_per_hour(bucket_m3, fill_factor, density_t_per_m3, cycle_time_min, passes)\n"
         "- availability(mtbf_h, mttr_h)\n"
         "- cost_per_tonne(fuel_lph, diesel_rs_per_l, prod_tph, other_rs_per_hr)\n"
-        "If a numeric question is asked, show formula, inputs and result.\n"
+        "If numeric, show formula, inputs and result.\n"
     )
     return (
         f"User question:\n{query}\n\n"
@@ -306,14 +283,13 @@ def build_user_prompt(query: str, hits: List[Tuple[float, DocChunk]]) -> str:
 if st.button("Answer", type="primary") and q:
     unsafe, why = is_unsafe(q)
     if unsafe:
-        st.error(why + " I can provide only high-level safety/regulatory guidance. Try rephrasing.")
+        st.error(why + " Try rephrasing (e.g., ask for regulations or safety guidelines).")
         st.stop()
 
-    with st.spinner("Searching authoritative India mining sources…"):
+    with st.spinner("Searching authoritative sources…"):
         docs, sources_used = build_context_from_web(q, max_sites=max_sites, prefer_domains=top_sites_only)
-
     if not docs:
-        st.warning("Couldn’t find strong sources. Try a more specific query or turn off domain filter.")
+        st.warning("Couldn’t find strong sources. Try more specific wording or disable the domain filter.")
         st.stop()
 
     retriever = Retriever(EMBED_MODEL)
@@ -322,7 +298,6 @@ if st.button("Answer", type="primary") and q:
 
     user_prompt = build_user_prompt(q, hits)
 
-    # Show sources upfront
     st.subheader("Sources I’m using")
     st.write(format_sources(sources_used))
 
@@ -346,4 +321,4 @@ if st.button("Answer", type="primary") and q:
             st.caption(d.url)
 
 st.markdown("---")
-st.caption("Disclaimer: Informational only. Always follow site SOPs and DGMS/IBM regulations. This tool performs live web search and may reflect source inaccuracies.")
+st.caption("Disclaimer: Informational only. Follow site SOPs and DGMS/IBM regulations. Live web search may reflect source inaccuracies.")
