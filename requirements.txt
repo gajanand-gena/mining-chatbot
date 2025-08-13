@@ -4,9 +4,7 @@ beautifulsoup4==4.12.3
 html2text==2024.2.26
 tldextract==5.1.2
 trafilatura==1.12.2
-
 pdfminer.six==20231228
-
 sentence-transformers==3.0.1
 faiss-cpu==1.8.0
 transformers==4.42.4
