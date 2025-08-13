@@ -1,4 +1,7 @@
 # streamlit_app.py
+# Mining Operations Chatbot (India) — Google-first Web RAG
+# Copy-paste into a file and run:  streamlit run streamlit_app.py
+
 import os, re, urllib.parse, io
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
@@ -30,9 +33,9 @@ MINING_KEYWORDS = [
     "MTBF","MTTR","availability","OEE","dispatch","mine planning"
 ]
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "thenlper/gte-small")
-LOCAL_HF_MODEL = os.getenv("LOCAL_HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")  # small, CPU ok
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # optional, only if OPENAI_API_KEY set
+EMBED_MODEL = os.getenv("EMBED_MODEL", "thenlper/gte-small")  # small, good quality
+LOCAL_HF_MODEL = os.getenv("LOCAL_HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")  # CPU-friendly
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # optional (only if OPENAI_API_KEY set)
 
 SYSTEM_PROMPT = """You are MINER-GPT, a safety-first assistant for mining operations in India.
 
@@ -53,16 +56,18 @@ SAFETY_BLOCKLIST = [
     r"illegal .*mining", r"forge .*certificate", r"improvised.*explosive"
 ]
 
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
+
 # =========================
 # Secrets / env
 # =========================
 def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     return st.secrets.get(name) if name in st.secrets else os.getenv(name, default)
 
-GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
-GOOGLE_CSE_ID  = get_secret("GOOGLE_CSE_ID")  # "cx"
-SERPAPI_API_KEY = get_secret("SERPAPI_API_KEY")
-OPENAI_API_KEY  = get_secret("OPENAI_API_KEY")
+GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")   # optional
+GOOGLE_CSE_ID  = get_secret("GOOGLE_CSE_ID")    # optional (aka "cx")
+SERPAPI_API_KEY = get_secret("SERPAPI_API_KEY") # optional
+OPENAI_API_KEY  = get_secret("OPENAI_API_KEY")  # optional
 
 # =========================
 # Utilities
@@ -85,6 +90,7 @@ def domain_bias_query(query: str, prefer_domains: bool, limit: int = 8) -> str:
 # Web search (Google-first)
 # =========================
 def google_search_json(query: str, max_results: int = 12) -> List[Dict]:
+    """Google Programmable Search JSON API (needs GOOGLE_API_KEY & GOOGLE_CSE_ID)."""
     if not (GOOGLE_API_KEY and GOOGLE_CSE_ID):
         return []
     items: List[Dict] = []
@@ -116,6 +122,7 @@ def google_search_json(query: str, max_results: int = 12) -> List[Dict]:
     return items
 
 def serpapi_search(query: str, max_results: int = 12) -> List[Dict]:
+    """SerpAPI fallback (needs SERPAPI_API_KEY)."""
     if not SERPAPI_API_KEY:
         return []
     try:
@@ -136,10 +143,10 @@ def serpapi_search(query: str, max_results: int = 12) -> List[Dict]:
         return []
 
 def ddg_html_fallback(query: str, max_results: int = 12) -> List[Dict]:
+    """DuckDuckGo Lite HTML (no keys)."""
     url = "https://duckduckgo.com/html/"
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
     try:
-        r = requests.get(url, params={"q": query}, headers=headers, timeout=20)
+        r = requests.get(url, params={"q": query}, headers=UA, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         out = []
@@ -174,8 +181,6 @@ def web_search(query: str, max_results: int, prefer_domains: bool) -> List[Dict]
 # =========================
 # Fetch & parse content
 # =========================
-UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
-
 def fetch_text(url: str, timeout: int = 20) -> str:
     """Fetch text from HTML or PDF. Returns '' on failure."""
     try:
@@ -272,7 +277,7 @@ class Retriever:
         return hits
 
 # =========================
-# Generation
+# Generation (CPU-only local by default — no accelerate needed)
 # =========================
 def has_openai() -> bool:
     return bool(OPENAI_API_KEY)
@@ -290,16 +295,17 @@ def gen_with_openai(system_prompt: str, user_prompt: str) -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_local_pipe():
+    # Force plain CPU path; avoids needing accelerate
     return pipeline(
         "text-generation",
         model=LOCAL_HF_MODEL,
         torch_dtype="auto",
-        device_map="auto",
         max_new_tokens=700,
         do_sample=True,
         temperature=0.2,
         repetition_penalty=1.05,
         trust_remote_code=True,
+        device=-1,  # CPU
     )
 
 def gen_with_local(system_prompt: str, user_prompt: str) -> str:
@@ -356,24 +362,23 @@ with st.sidebar:
         cost = (lph*price + other)/max(prod, 1e-6)
         st.info(f"Cost ≈ **₹{cost:.2f}/t**")
     st.markdown("---")
-    st.caption("Tip: ask “DGMS haul road gradient 100T”, “bench height opencast India”, “IBM monthly return format”. For absolute best search, add GOOGLE_API_KEY + GOOGLE_CSE_ID in Secrets.")
+    st.caption("Tip: add GOOGLE_API_KEY + GOOGLE_CSE_ID in Secrets for the strongest search. Try prompts like “DGMS haul road gradient 100T”, “bench height opencast India”, “IBM monthly return format”.")
 
-st.write("Ask anything about **mining operations (India)**. I’ll search the web, read it (HTML + PDF), and answer with citations.")
+st.write("Ask anything about **mining operations (India)**. I’ll search the web (HTML + PDF), retrieve the most relevant pieces, and answer with citations.")
 q = st.text_input("Your question", placeholder="e.g., DGMS haul road gradient for 100T trucks?")
 
 # =========================
-# Build web context (aggressive)
+# Build web context (aggressive, multi-pass)
 # =========================
-def build_context_from_web(query: str, max_sites: int, prefer_domains: bool) -> Tuple[List[DocChunk], List[Dict], bool]:
+def build_context_from_web(query: str, max_sites: int, prefer_domains_flag: bool) -> Tuple[List[DocChunk], List[Dict], bool]:
     """
     Returns: (docs, sources_used, broadened_flag)
-    - Pass 1: domain-biased (if prefer_domains)
+    - Pass 1: domain-biased (if prefer_domains_flag)
     - Pass 2: general query (no domain bias)
     - Pass 3: boosted with mining keywords
-    Stops when >= 5 chunks or 8+ sources parsed.
     """
     def run_once(qq: str, cap: int):
-        results = web_search(qq, max_results=cap, prefer_domains=False)  # we already baked domain ops into qq if needed
+        results = web_search(qq, max_results=cap, prefer_domains=False)  # bias baked into qq
         docs, used = [], []
         for r in results:
             url = r.get("href") or r.get("link") or r.get("url")
@@ -393,7 +398,7 @@ def build_context_from_web(query: str, max_sites: int, prefer_domains: bool) -> 
     broadened = False
 
     # Pass 1
-    q1 = domain_bias_query(query, prefer_domains, limit=8)
+    q1 = domain_bias_query(query, prefer_domains_flag, limit=8)
     d1, u1 = run_once(q1, max_sites)
     docs += d1; used += u1
 
@@ -401,7 +406,6 @@ def build_context_from_web(query: str, max_sites: int, prefer_domains: bool) -> 
     if len(docs) < 5:
         broadened = True
         d2, u2 = run_once(query, max_sites + 4)
-        # merge without dup URLs
         seen = {x["url"] for x in used}
         used += [x for x in u2 if x["url"] not in seen]
         docs += d2
@@ -454,9 +458,8 @@ if st.button("Answer", type="primary") and q:
         st.stop()
 
     with st.spinner("Searching + reading the web…"):
-        docs, sources_used, broadened = build_context_from_web(q, max_sites=max_sites, prefer_domains=prefer_domains)
+        docs, sources_used, broadened = build_context_from_web(q, max_sites=max_sites, prefer_domains_flag=prefer_domains)
 
-    # Even if docs are few, proceed and answer (with a caution)
     retriever = Retriever()
     if docs:
         retriever.build(docs)
@@ -481,7 +484,7 @@ if st.button("Answer", type="primary") and q:
 
     st.subheader("Answer")
     if not docs:
-        st.warning("Sources were sparse; answer may be limited. Consider adding GOOGLE_API_KEY + GOOGLE_CSE_ID in Secrets for stronger search.")
+        st.warning("Sources were sparse; answer may be limited. Add GOOGLE_API_KEY + GOOGLE_CSE_ID in Secrets for stronger search.")
     st.write(answer)
 
     if hits:
