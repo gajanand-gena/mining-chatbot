@@ -1,5 +1,5 @@
 # streamlit_app.py
-import os, re, urllib.parse, math
+import os, re, urllib.parse, io
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
@@ -21,7 +21,8 @@ DEFAULT_DOMAINS = [
     "dgms.gov.in","ibm.gov.in","mines.gov.in","coal.nic.in","moefcc.gov.in",
     "coalindia.in","secl-cil.in","nclcil.in","scclmines.com","nmdc.co.in","hzlindia.com",
     "vedantalimited.com","sail.co.in","hindustancopper.com","cmpdi.co.in",
-    "iitism.ac.in","iitkgp.ac.in","iitg.ac.in","bis.gov.in","isstandards.in","cat.com","komatsu.jp"
+    "iitism.ac.in","iitkgp.ac.in","iitg.ac.in","bis.gov.in","isstandards.in",
+    "cat.com","komatsu.jp"
 ]
 MINING_KEYWORDS = [
     "DGMS","IBM","MMDR","haul road","stripping ratio","dragline","shovel","dumper",
@@ -34,11 +35,13 @@ LOCAL_HF_MODEL = os.getenv("LOCAL_HF_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # optional, only if OPENAI_API_KEY set
 
 SYSTEM_PROMPT = """You are MINER-GPT, a safety-first assistant for mining operations in India.
+
 Rules:
 - Prefer Indian context: ₹, tonnes (t), bcm, kWh, DGMS/IBM/MMDR norms, Indian fleets.
 - Cite sources you used (domains). If unsure, say what is missing.
 - Be concise and practical for shift use; include bullet steps and formulas where useful.
 - Safety first: Do NOT provide explosives handling or instructions violating DGMS/regulations.
+
 Format:
 1) Direct answer
 2) Key steps / calculations
@@ -54,13 +57,12 @@ SAFETY_BLOCKLIST = [
 # Secrets / env
 # =========================
 def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
-    # Prefer Streamlit secrets, then env
     return st.secrets.get(name) if name in st.secrets else os.getenv(name, default)
 
 GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
-GOOGLE_CSE_ID = get_secret("GOOGLE_CSE_ID")   # aka "cx"
+GOOGLE_CSE_ID  = get_secret("GOOGLE_CSE_ID")  # "cx"
 SERPAPI_API_KEY = get_secret("SERPAPI_API_KEY")
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+OPENAI_API_KEY  = get_secret("OPENAI_API_KEY")
 
 # =========================
 # Utilities
@@ -72,10 +74,9 @@ def clean_domain(url: str) -> str:
     except Exception:
         return url
 
-def add_domain_operators(query: str, prefer_domains: bool, limit: int = 6) -> str:
+def domain_bias_query(query: str, prefer_domains: bool, limit: int = 8) -> str:
     if not prefer_domains:
         return query
-    # Keep query length reasonable for Google; include a few high-signal domains
     ops = " OR ".join([f"site:{d}" for d in DEFAULT_DOMAINS[:limit]])
     kw = " ".join(MINING_KEYWORDS[:6])
     return f"({query}) ({ops}) india mining {kw}"
@@ -83,15 +84,10 @@ def add_domain_operators(query: str, prefer_domains: bool, limit: int = 6) -> st
 # =========================
 # Web search (Google-first)
 # =========================
-def google_search_json(query: str, max_results: int = 8) -> List[Dict]:
-    """
-    Google Programmable Search JSON API (needs GOOGLE_API_KEY & GOOGLE_CSE_ID).
-    Returns: list of {title, href}
-    """
+def google_search_json(query: str, max_results: int = 12) -> List[Dict]:
     if not (GOOGLE_API_KEY and GOOGLE_CSE_ID):
         return []
     items: List[Dict] = []
-    # Google returns up to 10 items per request; paginate if needed
     for start in range(1, min(max_results, 50) + 1, 10):
         params = {
             "key": GOOGLE_API_KEY,
@@ -100,7 +96,7 @@ def google_search_json(query: str, max_results: int = 8) -> List[Dict]:
             "num": min(10, max_results - len(items)),
             "start": start,
             "safe": "active",
-            "lr": "lang_en"  # prefer English
+            "lr": "lang_en"
         }
         try:
             r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=20)
@@ -119,20 +115,11 @@ def google_search_json(query: str, max_results: int = 8) -> List[Dict]:
             break
     return items
 
-def serpapi_search(query: str, max_results: int = 8) -> List[Dict]:
-    """
-    SerpAPI fallback (needs SERPAPI_API_KEY).
-    """
+def serpapi_search(query: str, max_results: int = 12) -> List[Dict]:
     if not SERPAPI_API_KEY:
         return []
     try:
-        params = {
-            "engine": "google",
-            "q": query,
-            "num": max_results,
-            "hl": "en",
-            "api_key": SERPAPI_API_KEY,
-        }
+        params = {"engine": "google", "q": query, "num": max_results, "hl": "en", "api_key": SERPAPI_API_KEY}
         r = requests.get("https://serpapi.com/search.json", params=params, timeout=20)
         r.raise_for_status()
         data = r.json()
@@ -148,11 +135,7 @@ def serpapi_search(query: str, max_results: int = 8) -> List[Dict]:
     except Exception:
         return []
 
-def ddg_html_fallback(query: str, max_results: int = 8) -> List[Dict]:
-    """
-    DuckDuckGo Lite HTML (no keys). Returns list of {title, href}.
-    Handles /l/?uddg redirection links.
-    """
+def ddg_html_fallback(query: str, max_results: int = 12) -> List[Dict]:
     url = "https://duckduckgo.com/html/"
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
     try:
@@ -179,56 +162,59 @@ def ddg_html_fallback(query: str, max_results: int = 8) -> List[Dict]:
         return []
 
 def web_search(query: str, max_results: int, prefer_domains: bool) -> List[Dict]:
-    q = add_domain_operators(query, prefer_domains)
-    # 1) Google CSE
+    q = domain_bias_query(query, prefer_domains)
     items = google_search_json(q, max_results=max_results)
     if items:
         return items
-    # 2) SerpAPI
     items = serpapi_search(q, max_results=max_results)
     if items:
         return items
-    # 3) DDG Lite
     return ddg_html_fallback(q, max_results=max_results)
 
 # =========================
 # Fetch & parse content
 # =========================
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
+
 def fetch_text(url: str, timeout: int = 20) -> str:
-    """
-    Fetch text from HTML or PDF. Returns '' on failure.
-    """
+    """Fetch text from HTML or PDF. Returns '' on failure."""
     try:
-        # HEAD to check content-type (don't fail if blocked)
-        ctype = None
+        # HEAD to detect PDFs (don’t crash if blocked)
+        ctype = ""
         try:
-            h = requests.head(url, timeout=10, allow_redirects=True)
+            h = requests.head(url, timeout=10, allow_redirects=True, headers=UA)
             ctype = (h.headers.get("Content-Type") or "").lower()
         except Exception:
             pass
 
         # PDF path
-        if (ctype and "pdf" in ctype) or url.lower().endswith(".pdf"):
-            r = requests.get(url, timeout=timeout, stream=True)
+        if "pdf" in ctype or url.lower().endswith(".pdf"):
+            r = requests.get(url, timeout=timeout, headers=UA)
             r.raise_for_status()
-            return (pdf_extract_text(r.raw) or "").strip()[:200_000]
+            bio = io.BytesIO(r.content)
+            txt = pdf_extract_text(bio) or ""
+            return txt.strip()[:200_000]
 
         # HTML path
         downloaded = trafilatura.fetch_url(url, timeout=timeout)
         if not downloaded:
-            return ""
+            # fallback: requests + trafilatura on raw html
+            r = requests.get(url, timeout=timeout, headers=UA)
+            r.raise_for_status()
+            downloaded = r.text
+
         text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
-        if text and len(text.strip()) > 200:
+        if text and len(text.strip()) > 120:
             return text.strip()
 
-        # fallback: simple HTML → text
+        # last resort: html2text
         parser = html2text.HTML2Text()
         parser.ignore_links = True
-        return parser.handle(downloaded)[:20_000]
+        return parser.handle(downloaded)[:25_000]
     except Exception:
         return ""
 
-def chunk(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
+def chunk(text: str, chunk_size: int = 1200, overlap: int = 120) -> List[str]:
     parts = re.split(r"(?<=[\.\?\!])\s+|\n{2,}", text)
     chunks, cur = [], ""
     for p in parts:
@@ -309,7 +295,7 @@ def get_local_pipe():
         model=LOCAL_HF_MODEL,
         torch_dtype="auto",
         device_map="auto",
-        max_new_tokens=600,
+        max_new_tokens=700,
         do_sample=True,
         temperature=0.2,
         repetition_penalty=1.05,
@@ -344,8 +330,8 @@ st.title("⛏️ MINER-GPT (India) – Web-powered Mining Chatbot (Google-first)
 with st.sidebar:
     st.header("Settings")
     use_openai = st.toggle("Use OpenAI (set OPENAI_API_KEY)", value=has_openai())
-    prefer_domains = st.toggle("Prefer India mining domains", value=True)
-    max_sites = st.slider("Max sites to ingest per query", 3, 12, 8)
+    prefer_domains = st.toggle("Prefer India mining domains", value=False)  # default OFF for broader recall
+    max_sites = st.slider("Max sites to ingest per query", 5, 20, 12)
     top_k_ctx = st.slider("Retrieved chunks (Top-K)", 3, 12, 6)
     st.markdown("---")
     st.subheader("Mining calculators")
@@ -355,7 +341,8 @@ with st.sidebar:
         d = st.number_input("Density (t/m³)", 1.4, 3.5, 2.1, 0.1)
         c = st.number_input("Cycle time (min)", 0.3, 5.0, 0.9, 0.05)
         p = st.number_input("Passes", 1, 12, 4, 1)
-        st.info(f"Estimated **{ (b*f*d)*p* (60.0/c):.1f} tph**")
+        tph = (b*f*d)*p*(60.0/c)
+        st.info(f"Estimated **{tph:.1f} tph**")
     with st.expander("Equipment availability"):
         mtbf = st.number_input("MTBF (h)", 1.0, 500.0, 28.0, 0.5)
         mttr = st.number_input("MTTR (h)", 0.1, 48.0, 2.0, 0.1)
@@ -364,19 +351,29 @@ with st.sidebar:
     with st.expander("Cost per tonne (₹/t)"):
         lph = st.number_input("Fuel (L/h)", 5.0, 400.0, 80.0, 1.0)
         price = st.number_input("Diesel (₹/L)", 50.0, 140.0, 95.0, 1.0)
-        tph = st.number_input("Production (t/h)", 10.0, 10000.0, 800.0, 10.0)
+        prod = st.number_input("Production (t/h)", 10.0, 10000.0, 800.0, 10.0)
         other = st.number_input("Other ₹/h", 0.0, 100000.0, 1500.0, 100.0)
-        cost = (lph*price + other) / max(tph, 1e-6)
+        cost = (lph*price + other)/max(prod, 1e-6)
         st.info(f"Cost ≈ **₹{cost:.2f}/t**")
     st.markdown("---")
-    st.caption("Tip: e.g., “DGMS haul road gradient for 100T trucks”, “bench height limits for opencast”, “IBM monthly return norms”")
+    st.caption("Tip: ask “DGMS haul road gradient 100T”, “bench height opencast India”, “IBM monthly return format”. For absolute best search, add GOOGLE_API_KEY + GOOGLE_CSE_ID in Secrets.")
 
-st.write("Ask anything about **mining operations (India)**. I’ll search authoritative sources, read them, and answer with citations.")
-q = st.text_input("Your question", placeholder="e.g., Recommended haul road gradient per DGMS?")
+st.write("Ask anything about **mining operations (India)**. I’ll search the web, read it (HTML + PDF), and answer with citations.")
+q = st.text_input("Your question", placeholder="e.g., DGMS haul road gradient for 100T trucks?")
 
-def build_context_from_web(query: str, max_sites: int, prefer_domains: bool) -> Tuple[List[DocChunk], List[Dict]]:
-    def _run_once(q, cap):
-        results = web_search(q, max_results=cap, prefer_domains=prefer_domains)
+# =========================
+# Build web context (aggressive)
+# =========================
+def build_context_from_web(query: str, max_sites: int, prefer_domains: bool) -> Tuple[List[DocChunk], List[Dict], bool]:
+    """
+    Returns: (docs, sources_used, broadened_flag)
+    - Pass 1: domain-biased (if prefer_domains)
+    - Pass 2: general query (no domain bias)
+    - Pass 3: boosted with mining keywords
+    Stops when >= 5 chunks or 8+ sources parsed.
+    """
+    def run_once(qq: str, cap: int):
+        results = web_search(qq, max_results=cap, prefer_domains=False)  # we already baked domain ops into qq if needed
         docs, used = [], []
         for r in results:
             url = r.get("href") or r.get("link") or r.get("url")
@@ -384,21 +381,46 @@ def build_context_from_web(query: str, max_sites: int, prefer_domains: bool) -> 
                 continue
             domain = clean_domain(url)
             txt = fetch_text(url)
-            if len(txt) < 200:
+            if len(txt) < 120:
                 continue
-            for ch in chunk(txt, 900, 150)[:8]:
+            for ch in chunk(txt, 1200, 120)[:8]:
                 docs.append(DocChunk(text=ch, source=domain, url=url))
             used.append({"title": r.get("title") or domain, "url": url, "domain": domain})
         return docs, used
 
-    base_q = q if q else query
-    docs, used = _run_once(base_q, max_sites)
-    if not docs and prefer_domains:
-        # retry without domain bias
-        docs, used = _run_once(query, max_sites)
-    return docs, used
+    docs: List[DocChunk] = []
+    used: List[Dict] = []
+    broadened = False
+
+    # Pass 1
+    q1 = domain_bias_query(query, prefer_domains, limit=8)
+    d1, u1 = run_once(q1, max_sites)
+    docs += d1; used += u1
+
+    # Pass 2 (no domain bias) if weak
+    if len(docs) < 5:
+        broadened = True
+        d2, u2 = run_once(query, max_sites + 4)
+        # merge without dup URLs
+        seen = {x["url"] for x in used}
+        used += [x for x in u2 if x["url"] not in seen]
+        docs += d2
+
+    # Pass 3 (add mining keywords) if still weak
+    if len(docs) < 5:
+        broadened = True
+        kw = " ".join(MINING_KEYWORDS[:6])
+        q3 = f"{query} india mining {kw}"
+        d3, u3 = run_once(q3, max_sites + 6)
+        seen = {x["url"] for x in used}
+        used += [x for x in u3 if x["url"] not in seen]
+        docs += d3
+
+    return docs, used, broadened
 
 def format_sources(srcs: List[Dict]) -> str:
+    if not srcs:
+        return "_No sources parsed (answer may be limited)._"
     lines = []
     for s in srcs:
         title = (s["title"] or s["domain"]).strip()
@@ -406,11 +428,11 @@ def format_sources(srcs: List[Dict]) -> str:
         lines.append(f"- {title} ({s['domain']})")
     return "\n".join(lines)
 
-def build_user_prompt(query: str, hits: List[Tuple[float, DocChunk]]) -> str:
+def build_user_prompt(query: str, hits: List[Tuple[float, DocChunk]], broadened: bool) -> str:
     ctx_lines = []
     for i, (score, d) in enumerate(hits, 1):
         ctx_lines.append(f"[{i}] {d.text}\n(Source: {d.source} | {d.url})")
-    ctx_text = "\n\n---\n\n".join(ctx_lines)
+    ctx_text = "\n\n---\n\n".join(ctx_lines) if ctx_lines else "(No web context parsed — answer from general knowledge, flag uncertainty.)"
     helper = (
         "Useful calculators:\n"
         "- tonnes_per_hour(bucket_m3, fill_factor, density_t_per_m3, cycle_time_min, passes)\n"
@@ -418,8 +440,9 @@ def build_user_prompt(query: str, hits: List[Tuple[float, DocChunk]]) -> str:
         "- cost_per_tonne(fuel_lph, diesel_rs_per_l, prod_tph, other_rs_per_hr)\n"
         "If numeric, show formula, inputs and result.\n"
     )
+    note = "Note: Query was broadened beyond preferred domains due to sparse sources.\n" if broadened else ""
     return (
-        f"User question:\n{query}\n\n"
+        f"{note}User question:\n{query}\n\n"
         f"Use the context below if relevant. Quote & cite as [n]. If unsure, say what’s missing.\n\n"
         f"Context:\n{ctx_text}\n\n{helper}"
     )
@@ -430,17 +453,18 @@ if st.button("Answer", type="primary") and q:
         st.error(why + " Try rephrasing (e.g., ask for regulations or safety guidelines).")
         st.stop()
 
-    with st.spinner("Searching authoritative sources…"):
-        docs, sources_used = build_context_from_web(q, max_sites=max_sites, prefer_domains=prefer_domains)
-    if not docs:
-        st.warning("Couldn’t find strong sources. Try toggling domain preference off, or ask more specifically.")
-        st.stop()
+    with st.spinner("Searching + reading the web…"):
+        docs, sources_used, broadened = build_context_from_web(q, max_sites=max_sites, prefer_domains=prefer_domains)
 
+    # Even if docs are few, proceed and answer (with a caution)
     retriever = Retriever()
-    retriever.build(docs)
-    hits = retriever.search(q, k=top_k_ctx)
+    if docs:
+        retriever.build(docs)
+        hits = retriever.search(q, k=top_k_ctx)
+    else:
+        hits = []
 
-    user_prompt = build_user_prompt(q, hits)
+    user_prompt = build_user_prompt(q, hits, broadened)
 
     st.subheader("Sources I’m using")
     st.write(format_sources(sources_used))
@@ -456,13 +480,16 @@ if st.button("Answer", type="primary") and q:
             st.stop()
 
     st.subheader("Answer")
+    if not docs:
+        st.warning("Sources were sparse; answer may be limited. Consider adding GOOGLE_API_KEY + GOOGLE_CSE_ID in Secrets for stronger search.")
     st.write(answer)
 
-    st.subheader("Retrieved context (for transparency)")
-    for i, (score, d) in enumerate(hits, 1):
-        with st.expander(f"[{i}] {d.source} — score {score:.3f}"):
-            st.write(d.text)
-            st.caption(d.url)
+    if hits:
+        st.subheader("Retrieved context (for transparency)")
+        for i, (score, d) in enumerate(hits, 1):
+            with st.expander(f"[{i}] {d.source} — score {score:.3f}"):
+                st.write(d.text)
+                st.caption(d.url)
 
 st.markdown("---")
 st.caption("Disclaimer: Informational only. Follow site SOPs and DGMS/IBM regulations. Live web search may reflect source inaccuracies.")
